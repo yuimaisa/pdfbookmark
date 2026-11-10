@@ -89,7 +89,10 @@ def error_message(exc):
 
 
 def ocr_controls(data, index, entries, reference):
-    st.markdown("**本文のローカルOCR**")
+    first, last = min(st.session_state.toc_pages), max(st.session_state.toc_pages)
+    extracted_toc = toc_text(index, first, last)
+    st.session_state.setdefault("toc_text", extracted_toc)
+    refresh_toc = st.session_state.toc_text == extracted_toc
     plan = st.session_state.get("ocr_plan")
     active = bool(plan and plan.active)
     engine_name = st.selectbox(
@@ -99,9 +102,16 @@ def ocr_controls(data, index, entries, reference):
         disabled=active,
     )
     device = st.selectbox("OCRデバイス", ["cpu", "gpu:0"], key="ocr_device", disabled=active)
+    if not entries and not active:
+        st.session_state.ocr_mode = "全文OCR"
     mode = st.selectbox(
-        "OCR実行モード", ["高速（必要なページを優先）", "全文OCR"], key="ocr_mode", disabled=active
+        "OCR実行モード",
+        ["高速（必要なページを優先）", "全文OCR"],
+        key="ocr_mode",
+        disabled=active or not entries,
     )
+    if not entries:
+        st.caption("目次の解析前は全文OCRを実行します。高速モードは目次解析後に選べます。")
     dpi = st.number_input(
         "OCR解像度（dpi）",
         min_value=72,
@@ -121,7 +131,7 @@ def ocr_controls(data, index, entries, reference):
             st.warning("OCR失敗ページ: " + ", ".join(map(str, plan.failed)))
     start = st.button("OCRを実行・再開", disabled=active)
     retry = st.button("失敗ページのみ再処理", disabled=active or not bool(plan and plan.failed))
-    unresolved = st.button("未解決項目を再解析", disabled=active)
+    unresolved = st.button("未解決項目を再解析", disabled=active or not entries)
     if st.button("OCRを中断", disabled=not active):
         plan.active = False
     if start or retry or unresolved:
@@ -157,7 +167,7 @@ def ocr_controls(data, index, entries, reference):
             elif start and plan and not plan.active and plan.pending and plan.mode != "retry":
                 plan.active = True
             else:
-                full = mode == "全文OCR" or unresolved
+                full = not entries or mode == "全文OCR" or unresolved
                 stage = 3 if full else 0
                 pending, _ = plan_pages(
                     index, entries, set(st.session_state.toc_pages), stage, reference
@@ -190,6 +200,8 @@ def ocr_controls(data, index, entries, reference):
                     f"キャッシュ {plan.cache_hits + hits}",
                 ),
             )
+            if refresh_toc:
+                st.session_state.toc_text = toc_text(batch.index, first, last)
             index = batch.index
             st.session_state.index = index
             attempted = set(batch.completed + batch.failed)
@@ -214,7 +226,11 @@ def ocr_controls(data, index, entries, reference):
                     st.session_state.match_report = report
                     st.session_state.notice = (
                         f"OCR完了: {plan.completed}ページ / 失敗 {len(plan.failed)}ページ。"
-                        "移動先を確認してください。"
+                        + (
+                            "移動先を確認してください。"
+                            if entries
+                            else "続いて目次ページを指定して解析してください。"
+                        )
                     )
             processed = True
         except (ValueError, OSError):
@@ -341,7 +357,12 @@ def main():
         st.info("画像PDFです。目次画像をDeepSeekで解析し、本文はローカルOCRで認識できます。")
     if index.text_page_count < index.page_count * 0.5:
         st.warning("テキストを持つページが半数未満です。OCRが未完了の可能性があります。")
-    st.subheader("2. 目次ページを指定する")
+    st.subheader("2. ローカルOCRを実行する")
+    st.caption("画像PDFはここでOCRできます。テキストレイヤーがあるPDFはそのまま次へ進めます。")
+    index = ocr_controls(
+        data, index, st.session_state.entries, st.session_state.get("page_reference")
+    )
+    st.subheader("3. 目次ページを指定する")
     st.caption("画面上のページ番号はすべて1始まりです。目次ページは本文検索から除外します。")
     with st.form("toc_range"):
         a, b = st.columns(2)
@@ -374,7 +395,7 @@ def main():
         page = st.selectbox("目次プレビューのPDFページ", st.session_state.toc_pages or [1])
         if st.checkbox("目次画像を表示"):
             st.image(cached_preview(data, page), caption=f"PDFページ {page}", width=700)
-    st.subheader("3. 目次を構造化する")
+    st.subheader("4. 目次を構造化する")
     st.caption("解析ボタンを押したときだけAPIを呼び出します。既存の編集結果は置き換わります。")
     input_mode = st.radio(
         "目次解析の入力",
@@ -422,7 +443,7 @@ def main():
     if not entries:
         st.info("目次を解析するかJSONを読み込むと、自動照合・編集に進めます。")
         return
-    st.subheader("4. 本文とページ番号を照合する")
+    st.subheader("5. 本文とページ番号を照合する")
     st.caption(
         "本文先頭の印刷ページがPDFの何ページ目か分かる場合は、ページ対応を指定できます。"
         "例：印刷1ページがPDF12ページ目なら、目次の印刷ページに11を足して推定します。"
@@ -470,8 +491,6 @@ def main():
                 caption=f"PDFページ {reference.pdf_page} / 印刷ページ {reference.printed_page}",
                 width=700,
             )
-    index = ocr_controls(data, index, entries, reference)
-    entries = st.session_state.entries
     keep_manual = st.checkbox("再照合時に手動指定した移動先を保持", value=True)
     if st.button("自動ページ照合を実行"):
         progress = st.progress(0.0, text="本文見出しを検索し、ページ対応を推定しています…")
@@ -504,7 +523,7 @@ def main():
             st.warning(warning)
         with st.expander("ページ対応の推定根拠"):
             st.dataframe([vars(s) for s in report.page_map.segments], hide_index=True)
-    st.subheader("5. 確認・編集する")
+    st.subheader("6. 確認・編集する")
     cols = st.columns(4)
     for col, status in zip(cols, ("Verified", "Probable", "Estimated", "Unresolved"), strict=False):
         col.metric(status, sum(e.status == status for e in entries))
@@ -615,7 +634,7 @@ def main():
                 st.image(
                     cached_preview(data, preview), caption=f"PDFページ {preview}", width="stretch"
                 )
-    st.subheader("6. 保存・ダウンロード")
+    st.subheader("7. 保存・ダウンロード")
     st.download_button(
         "中間結果JSONをダウンロード",
         export_project(
