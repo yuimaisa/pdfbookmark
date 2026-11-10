@@ -22,6 +22,16 @@ from pdfbookmark.llm import (
 )
 from pdfbookmark.matching import match_entries
 from pdfbookmark.models import Bookmark, PageReference
+from pdfbookmark.ocr import (
+    OcrCache,
+    OcrError,
+    OcrSettings,
+    PaddleEngine,
+    TesseractEngine,
+    ocr_pages,
+)
+from pdfbookmark.ocr_setup import cache_directory
+from pdfbookmark.ocr_workflow import OcrPlan, plan_pages
 from pdfbookmark.pdf import extract_index, render_page, toc_text
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -56,6 +66,7 @@ def set_page_reference(reference):
     if reference == st.session_state.get("page_reference"):
         return
     st.session_state.page_reference = reference
+    st.session_state.pop("ocr_plan", None)
     replace_entries(
         [
             entry
@@ -77,9 +88,148 @@ def error_message(exc):
         st.error(str(exc))
 
 
+def ocr_controls(data, index, entries, reference):
+    st.markdown("**本文のローカルOCR**")
+    plan = st.session_state.get("ocr_plan")
+    active = bool(plan and plan.active)
+    engine_name = st.selectbox(
+        "OCRエンジン",
+        ["Tesseract（日本語・英語 / CPU）", "PP-OCRv6 medium"],
+        key="ocr_backend",
+        disabled=active,
+    )
+    device = st.selectbox("OCRデバイス", ["cpu", "gpu:0"], key="ocr_device", disabled=active)
+    mode = st.selectbox(
+        "OCR実行モード", ["高速（必要なページを優先）", "全文OCR"], key="ocr_mode", disabled=active
+    )
+    dpi = st.number_input(
+        "OCR解像度（dpi）",
+        min_value=72,
+        max_value=400,
+        value=200,
+        step=20,
+        key="ocr_dpi",
+        disabled=active,
+    )
+    st.caption(f"永続キャッシュ: {cache_directory() / 'ocr.sqlite3'}（本文テキストを含みます）")
+    if plan:
+        st.caption(
+            f"完了 {plan.completed}ページ / 失敗 {len(plan.failed)}ページ / "
+            f"キャッシュ再利用 {plan.cache_hits}ページ / 残り候補 {len(plan.pending)}ページ"
+        )
+        if plan.failed:
+            st.warning("OCR失敗ページ: " + ", ".join(map(str, plan.failed)))
+    start = st.button("OCRを実行・再開", disabled=active)
+    retry = st.button("失敗ページのみ再処理", disabled=active or not bool(plan and plan.failed))
+    unresolved = st.button("未解決項目を再解析", disabled=active)
+    if st.button("OCRを中断", disabled=not active):
+        plan.active = False
+    if start or retry or unresolved:
+        try:
+            config = (engine_name, device, dpi)
+            if engine_name.startswith("Tesseract") and device != "cpu":
+                raise OcrError("TesseractはCPUを選択してください")
+            if st.session_state.get("ocr_config") != config:
+                failed_pages = list(plan.failed) if plan else []
+                engine = (
+                    TesseractEngine()
+                    if engine_name.startswith("Tesseract")
+                    else PaddleEngine(device)
+                )
+                st.session_state.ocr_engine = engine
+                st.session_state.ocr_config = config
+                index = cached_index(data)
+                st.session_state.index = index
+                replace_entries(
+                    [
+                        e
+                        if e.manual
+                        else Bookmark(
+                            **e.model_dump(include={"id", "level", "title", "printed_page"})
+                        )
+                        for e in entries
+                    ]
+                )
+                entries = st.session_state.entries
+                plan = OcrPlan(mode="retry", pending=failed_pages, active=False) if retry else None
+            if retry:
+                plan = OcrPlan(mode="retry", stage=3, pending=list(plan.failed))
+            elif start and plan and not plan.active and plan.pending and plan.mode != "retry":
+                plan.active = True
+            else:
+                full = mode == "全文OCR" or unresolved
+                stage = 3 if full else 0
+                pending, _ = plan_pages(
+                    index, entries, set(st.session_state.toc_pages), stage, reference
+                )
+                plan = OcrPlan(mode="full" if full else "fast", stage=stage, pending=pending)
+            st.session_state.ocr_plan = plan
+        except OcrError as exc:
+            st.error(str(exc))
+            return index
+        except (OSError, ValueError):
+            st.error(
+                "OCRを準備できません。READMEのpixi環境・モデルセットアップを確認してください。"
+            )
+            return index
+    if plan and plan.active:
+        progress = st.progress(0.0, text="本文をローカルOCR中…（ページ単位で保存します）")
+        processed = False
+        try:
+            batch = ocr_pages(
+                data,
+                index,
+                st.session_state.ocr_engine,
+                OcrSettings(dpi=int(dpi)),
+                OcrCache(),
+                plan.pending,
+                limit=3,
+                progress=lambda done, failed, hits: progress.progress(
+                    min(1.0, (done + failed) / max(1, min(3, len(plan.pending)))),
+                    text=f"完了 {plan.completed + done} / 失敗 {len(plan.failed) + failed} / "
+                    f"キャッシュ {plan.cache_hits + hits}",
+                ),
+            )
+            index = batch.index
+            st.session_state.index = index
+            attempted = set(batch.completed + batch.failed)
+            plan.pending = [n for n in plan.pending if n not in attempted]
+            plan.completed += len(batch.completed)
+            plan.failed = sorted(set(plan.failed + batch.failed))
+            plan.cache_hits += batch.cache_hits
+            if not plan.pending:
+                report = match_entries(
+                    index, entries, set(st.session_state.toc_pages), page_reference=reference
+                )
+                needs_more = any(e.status in {"Unresolved", "Estimated"} for e in report.entries)
+                if plan.mode == "fast" and needs_more and plan.stage < 3:
+                    plan.stage += 1
+                    pending, _ = plan_pages(
+                        index, entries, set(st.session_state.toc_pages), plan.stage, reference
+                    )
+                    plan.pending = [n for n in pending if n not in plan.failed]
+                else:
+                    plan.active = False
+                    replace_entries(report.entries)
+                    st.session_state.match_report = report
+                    st.session_state.notice = (
+                        f"OCR完了: {plan.completed}ページ / 失敗 {len(plan.failed)}ページ。"
+                        "移動先を確認してください。"
+                    )
+            processed = True
+        except (ValueError, OSError):
+            plan.active = False
+            st.error("OCR処理を中断しました。キャッシュの保存先とOCR環境を確認してください。")
+        finally:
+            progress.empty()
+        if plan.active or processed:
+            st.rerun()
+    return index
+
+
 def main():
     st.title("pdfbookmark")
-    st.caption("OCR済みの書籍PDFに、確かな移動先と階層付きブックマークを。")
+    st.caption("書籍PDFに、確かな移動先と階層付きブックマークを。")
     notice = st.empty()
     if message := st.session_state.pop("notice", None):
         notice.success(message)
@@ -103,11 +253,11 @@ def main():
         else:
             st.caption("Structured Outputs対応モデルを指定してください。")
         st.info(
-            f"{provider}に送信するのは、画面で確認した目次テキストだけです。"
+            f"{provider}に送信するのは、選択した目次テキストまたは目次画像です。"
             "本文の照合はローカルで行います。"
         )
         st.caption(
-            "入力したAPIキー・PDF・抽出テキストをアプリからファイルやログに保存しません。"
+            "APIキー・PDF画像は保存しません。本文OCRテキストはローカルキャッシュに保存します。"
             "中間JSONには見出しが含まれます。"
         )
         st.markdown("**状態の読み方**")
@@ -116,7 +266,7 @@ def main():
             "\n\nEstimated：ページ対応だけの推定\n\nUnresolved：移動先が未確定"
         )
     st.subheader("1. PDFを読み込む")
-    upload = st.file_uploader("OCR済みPDF", type=["pdf"], on_change=clear_demo)
+    upload = st.file_uploader("PDF", type=["pdf"], on_change=clear_demo)
     if st.button("500ページのサンプルPDFで試す"):
         st.session_state.demo_data = demo_pdf()
     if st.session_state.get("demo_data"):
@@ -140,11 +290,12 @@ def main():
         progress.empty()
         # Commit document state only after the new PDF was opened successfully.
         for key in list(st.session_state):
-            if key.startswith(("editor_", "preview_", "reference_")) or key in {
+            if key.startswith(("editor_", "preview_", "reference_", "ocr_")) or key in {
                 "entries",
                 "output_pdf",
                 "match_report",
                 "toc_text",
+                "toc_input_mode",
                 "range_first",
                 "range_last",
                 "pending_project",
@@ -187,9 +338,7 @@ def main():
         with st.expander("既存ブックマークを確認"):
             st.dataframe(index.existing_toc, column_order=[0, 1, 2], hide_index=True)
     if not index.text_page_count:
-        st.error("テキストレイヤーが見つかりません。外部ツールでOCRしてから読み込んでください。")
-        st.image(cached_preview(data, 1), caption="PDFページ 1", width=650)
-        return
+        st.info("画像PDFです。目次画像をDeepSeekで解析し、本文はローカルOCRで認識できます。")
     if index.text_page_count < index.page_count * 0.5:
         st.warning("テキストを持つページが半数未満です。OCRが未完了の可能性があります。")
     st.subheader("2. 目次ページを指定する")
@@ -210,6 +359,7 @@ def main():
             st.session_state.toc_text = text
             if pages != st.session_state.toc_pages:
                 replace_entries([])
+                st.session_state.pop("ocr_plan", None)
             st.session_state.toc_pages = pages
             reference = st.session_state.get("page_reference")
             if reference is not None and reference.pdf_page in pages:
@@ -226,10 +376,25 @@ def main():
             st.image(cached_preview(data, page), caption=f"PDFページ {page}", width=700)
     st.subheader("3. 目次を構造化する")
     st.caption("解析ボタンを押したときだけAPIを呼び出します。既存の編集結果は置き換わります。")
+    input_mode = st.radio(
+        "目次解析の入力",
+        ["テキスト", "画像"],
+        index=0 if any(index.pages[n - 1].normalized for n in st.session_state.toc_pages) else 1,
+        key="toc_input_mode",
+    )
+    if input_mode == "画像":
+        st.caption("選択した目次ページだけをPNG画像としてDeepSeekに送信します（上限12ページ）。")
     if st.button("LLMで目次を解析", type="primary", disabled=not bool(api_key.strip())):
         try:
             with st.spinner("目次を解析しています…"):
-                parsed = parser_class(api_key, model).parse(st.session_state.toc_text)
+                if input_mode == "画像":
+                    if provider != "DeepSeek":
+                        raise TocParseError("目次画像の解析にはDeepSeekを選択してください")
+                    parsed = DeepSeekTocParser(api_key, model).parse_pdf_images(
+                        data, st.session_state.toc_pages
+                    )
+                else:
+                    parsed = parser_class(api_key, model).parse(st.session_state.toc_text)
             replace_entries([Bookmark(**e.model_dump()) for e in parsed.entries])
             st.success(f"目次を{len(parsed.entries)}件抽出しました。")
         except (TocParseError, ValueError) as exc:
@@ -305,6 +470,8 @@ def main():
                 caption=f"PDFページ {reference.pdf_page} / 印刷ページ {reference.printed_page}",
                 width=700,
             )
+    index = ocr_controls(data, index, entries, reference)
+    entries = st.session_state.entries
     keep_manual = st.checkbox("再照合時に手動指定した移動先を保持", value=True)
     if st.button("自動ページ照合を実行"):
         progress = st.progress(0.0, text="本文見出しを検索し、ページ対応を推定しています…")
@@ -429,6 +596,21 @@ def main():
                 step=1,
                 key=f"preview_{selected.id}_{selected.pdf_page}",
             )
+            ocr_page = index.pages[preview - 1]
+            if ocr_page.source == "ocr":
+                st.caption("ローカルOCR結果（PDF座標・読み取り順）")
+                st.dataframe(
+                    [
+                        {
+                            "行": line.order,
+                            "テキスト": line.text,
+                            "信頼度": round(line.confidence, 3),
+                            "PDF座標": str(line.bbox),
+                        }
+                        for line in ocr_page.lines
+                    ],
+                    hide_index=True,
+                )
             if st.checkbox("対象ページの画像を表示", value=True):
                 st.image(
                     cached_preview(data, preview), caption=f"PDFページ {preview}", width="stretch"

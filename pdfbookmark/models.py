@@ -56,6 +56,8 @@ class Candidate(BaseModel):
     method: str
     y: float
     reasons: list[str]
+    source: str = "text"
+    ocr_confidence: float = Field(default=1, ge=0, le=1)
 
 
 class Bookmark(TocEntry):

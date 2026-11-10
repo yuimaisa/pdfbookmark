@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pdfbookmark"
 version = "0.1.0"
-description = "OCR済み書籍PDFの目次から階層付きブックマークを生成"
+description = "書籍PDFの目次から階層付きブックマークを生成"
 requires-python = ">=3.11"
 dependencies = [
   "streamlit>=1.50,<2",
@@ -19,13 +19,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+paddle = ["paddleocr==3.7.0", "paddlepaddle==3.3.1"]
 
 [tool.setuptools.packages.find]
 include = ["pdfbookmark*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: opt-in live LLM API tests (costs money)"]
+markers = ["integration: opt-in live LLM API tests (costs money)", "ocr_integration: opt-in real local OCR tests"]
 
 [tool.ruff]
 line-length = 100
@@ -36,9 +37,9 @@ select = ["E", "F", "I", "B", "UP"]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
-platforms = ["linux-64", "osx-arm64", "osx-64", "win-64"]
+platforms = ["linux-64", "osx-arm64", "osx-64", "win-64", "linux-aarch64"]
 requires-pixi = ">=0.84.1"
-# Only Python comes from conda; all application and dev packages come from PyPI.
+# Python and optional Tesseract come from conda; Python packages come from PyPI.
 conda-pypi-map = false
 
 [tool.pixi.pypi-dependencies]
@@ -48,7 +49,7 @@ pdfbookmark = { path = ".", editable = true }
 start = "streamlit run app.py"
 
 [tool.pixi.feature.dev.tasks]
-test = "pytest -m 'not integration'"
+test = "pytest -m 'not integration and not ocr_integration'"
 lint = "ruff check ."
 format = "ruff format ."
 format-check = "ruff format --check ."
@@ -69,3 +70,15 @@ python = "3.13.*"
 default = { features = ["dev", "py312"] }
 py311 = { features = ["dev", "py311"] }
 py313 = { features = ["dev", "py313"] }
+ocr = { features = ["dev", "py312", "ocr"] }
+paddle = { features = ["dev", "py312", "ocr", "paddle"] }
+
+[tool.pixi.feature.ocr.dependencies]
+tesseract = ">=5.5,<6"
+
+[tool.pixi.feature.ocr.tasks]
+ocr-setup = "python -m pdfbookmark.ocr_setup"
+test-ocr = "pytest tests/test_ocr_integration.py -m ocr_integration -q"
+
+[tool.pixi.feature.paddle]
+platforms = ["linux-64", "osx-arm64", "win-64"]

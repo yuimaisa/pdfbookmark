@@ -1,0 +1,22 @@
+name: Optional OCR models
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  paddle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUN_OCR_TESTS: '1'
+      OCR_TEST_ENGINE: paddle
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: 'True'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        with:
+          pixi-version: v0.84.1
+          environments: paddle
+          locked: true
+          cache: true
+      - run: pixi run --locked -e paddle test-ocr
