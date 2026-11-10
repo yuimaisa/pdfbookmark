@@ -30,8 +30,6 @@ class Span:
     y: float
     prominent: bool
     running: bool
-    source: str
-    confidence: float
 
 
 class HeadingIndex:
@@ -49,9 +47,7 @@ class HeadingIndex:
         for page in index.pages:
             if page.number in excluded:
                 continue
-            heights = [line.bbox[3] - line.bbox[1] for line in page.lines]
-            typical = median(heights) if heights else 10
-            typical_size = median([line.size for line in page.lines]) if page.lines else 10
+            typical = median([line.size for line in page.lines]) if page.lines else 10
             for i, line in enumerate(page.lines):
                 # Include up to three nearby lines to reconstruct wrapped headings.
                 for count in range(1, 4):
@@ -59,12 +55,7 @@ class HeadingIndex:
                     if len(group) != count:
                         break
                     if count > 1 and any(
-                        b.bbox[1] - a.bbox[3]
-                        > max(
-                            a.bbox[3] - a.bbox[1] if a.source == "ocr" else a.size,
-                            b.bbox[3] - b.bbox[1] if b.source == "ocr" else b.size,
-                        )
-                        * 1.6
+                        b.bbox[1] - a.bbox[3] > max(a.size, b.size) * 1.6
                         or abs(b.bbox[0] - a.bbox[0]) > 80
                         for a, b in zip(group, group[1:], strict=False)
                     ):
@@ -82,22 +73,8 @@ class HeadingIndex:
                         prefix,
                         body,
                         y,
-                        (
-                            line.bbox[3] - line.bbox[1] >= typical * 1.25
-                            or (
-                                len(normalized) < 100
-                                and (i == 0 or line.bbox[1] - page.lines[i - 1].bbox[3] > typical)
-                                and (
-                                    i + count == len(page.lines)
-                                    or page.lines[i + count].bbox[1] - group[-1].bbox[3] > typical
-                                )
-                            )
-                            if line.source == "ocr"
-                            else line.size >= typical_size * 1.15
-                        ),
+                        line.size >= typical * 1.15,
                         (y < 0.085 or y > 0.91) and len(margins[line.normalized]) >= 3,
-                        line.source,
-                        min(part.confidence for part in group),
                     )
                     n = len(self.spans)
                     self.spans.append(span)
@@ -134,14 +111,7 @@ class HeadingIndex:
             score = similarity * 0.78 + 0.08 + 0.07 * (1 - span.y) ** 0.5
             score += 0.07 if span.prominent else 0.015
             if span.prominent:
-                reasons.append(
-                    "周辺より大きい文字・独立した行"
-                    if span.source == "ocr"
-                    else "周辺より大きい文字"
-                )
-            if span.source == "ocr":
-                score -= (1 - span.confidence) * 0.30
-                reasons.append(f"OCR認識信頼度 {span.confidence:.0%}（PDF座標で位置評価）")
+                reasons.append("周辺より大きい文字")
             if prefix and span.prefix:
                 if prefix == span.prefix:
                     score += 0.025
@@ -167,8 +137,6 @@ class HeadingIndex:
                 method=method,
                 y=span.y,
                 reasons=reasons,
-                source=span.source,
-                ocr_confidence=span.confidence,
             )
             old = per_page.get(span.page)
             if old is None or candidate.score > old.score:
@@ -352,7 +320,6 @@ def match_entries(
             and found[0].score >= 0.90
             and found[0].similarity >= 0.97
             and found[0].method != "曖昧一致"
-            and (found[0].source != "ocr" or found[0].ocr_confidence >= 0.90)
         )
         if parsed and (manual or strong):
             raw_anchors.append(
@@ -361,8 +328,7 @@ def match_entries(
         if progress:
             progress(0.65 * (i + 1) / max(1, len(entries)))
     anchors = monotone_anchors(raw_anchors)
-    number_anchors = page_number_anchors(index, toc_pages)
-    page_map = PageMap(anchors + number_anchors, page_reference)
+    page_map = PageMap(anchors, page_reference)
     results = []
     warnings = list(page_map.warnings)
     if len(anchors) < len(raw_anchors):
@@ -392,10 +358,6 @@ def match_entries(
                 elif distance > 3:
                     c.score = max(0, c.score - 0.10)
                     c.reasons.append(f"ページ対応から{distance}ページ離れている")
-                if c.source == "ocr" and distance:
-                    # Distinguish duplicate headings on adjacent leaves, even
-                    # when their raw text scores both saturate near one.
-                    c.score = max(0, c.score - 0.045 * min(distance, 3))
             ranked.append(c)
         ranked.sort(key=lambda c: (-c.score, c.pdf_page))
         result.candidates = ranked[:5]
@@ -411,10 +373,6 @@ def match_entries(
             and direct.similarity >= 0.97
             and direct.method != "曖昧一致"
             and previous <= direct.pdf_page <= following
-            and (
-                direct.source != "ocr"
-                or (direct.ocr_confidence >= 0.90 and predicted == direct.pdf_page)
-            )
         ):
             # A strong heading beats a provisional numeric model, especially just
             # after an insertion/deletion that has not yet gained two anchors.
@@ -471,27 +429,3 @@ def match_entries(
                     e.pdf_page, e.status, e.confidence = None, "Unresolved", 0
                     e.reasons.append("隣接する見出しの移動先と順序が矛盾するため要確認")
     return MatchReport(results, page_map, len(anchors), warnings)
-
-
-def page_number_anchors(index: PdfIndex, excluded: set[int]) -> list[Anchor]:
-    """Only isolated high-confidence margin labels, never a heading verification."""
-    found = []
-    for page in index.pages:
-        if page.number in excluded or page.source != "ocr":
-            continue
-        labels = set()
-        for line in page.lines:
-            if line.confidence < 0.85:
-                continue
-            if line.bbox[3] / page.height > 0.12 and line.bbox[1] / page.height < 0.88:
-                continue
-            value = line.text.strip().strip("-–—·• ")
-            parsed = printed_number(re.sub(r"\s+", "", value))
-            if parsed is not None:
-                labels.add(parsed)
-        if len(labels) == 1:
-            domain, number = labels.pop()
-            found.append(Anchor(-1, domain, number, page.number))
-    # Duplicated leaves/number resets cannot supply a unique automatic mapping.
-    counts = Counter((a.domain, a.printed) for a in found)
-    return [a for a in found if counts[a.domain, a.printed] == 1]
