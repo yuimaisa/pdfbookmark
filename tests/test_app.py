@@ -1,11 +1,12 @@
 from pathlib import Path
 
+import pymupdf
 from streamlit.testing.v1 import AppTest
 
 from pdfbookmark.demo import demo_entries
 from pdfbookmark.export import export_project, import_project
 from pdfbookmark.llm import DeepSeekTocParser, TocParseError
-from pdfbookmark.models import Bookmark, PageReference
+from pdfbookmark.models import Bookmark, PageReference, TocDocument, TocEntry
 
 APP = Path(__file__).resolve().parents[1] / "app.py"
 
@@ -47,25 +48,118 @@ def test_invalid_page_range_is_shown_without_crash():
     click(app, "500ページのサンプルPDFで試す")
     app.number_input(key="range_first").set_value(8)
     app.number_input(key="range_last").set_value(3)
-    click(app, "この範囲の目次テキストを抽出")
+    click(app, "目次ページを設定")
     assert any("範囲が不正" in e.value for e in app.error)
 
 
-def test_image_only_pdf_requests_external_ocr_and_can_be_replaced(make_image_pdf, make_pdf):
+def test_image_only_pdf_defaults_to_images_and_resets_for_text_pdf(make_image_pdf, make_pdf):
     app = AppTest.from_file(str(APP))
     app.session_state["demo_data"] = make_image_pdf({2: "Image-only contents"}, pages=5)
     app.run(timeout=30)
     assert not app.exception
     assert app.session_state["index"].text_page_count == 0
-    assert any("別ソフトでOCR" in e.value for e in app.error)
-    assert not any(b.label == "LLMで目次を解析" for b in app.button)
+    assert not app.error
+    assert app.radio(key="toc_input_mode").value == "画像"
+    assert any(b.label == "LLMで目次を解析" for b in app.button)
 
     app.session_state["demo_data"] = make_pdf({2: ["Foundations ........ 1"]})
     app.run(timeout=30)
     assert not app.exception
     assert not app.error
+    assert app.radio(key="toc_input_mode").value == "テキスト"
     assert "Foundations" in app.session_state["toc_text"]
     assert any(b.label == "LLMで目次を解析" for b in app.button)
+
+
+def test_image_pdf_api_to_page_reference_to_export_and_parse_error(make_image_pdf, monkeypatch):
+    calls = []
+
+    def parse(self, data, pages):
+        calls.append((data, pages))
+        return TocDocument(
+            entries=[
+                TocEntry(level=1, title="Foundations", printed_page="1"),
+                TocEntry(level=2, title="Methods", printed_page="2"),
+            ]
+        )
+
+    monkeypatch.setattr(DeepSeekTocParser, "parse_pdf_images", parse)
+    data = make_image_pdf({2: "Contents", 4: "Foundations", 5: "Methods"}, pages=5)
+    app = AppTest.from_file(str(APP))
+    app.session_state["demo_data"] = data
+    app.run(timeout=30)
+    app.text_input(key="DEEPSEEK_api_key").set_value("unit-test-key").run(timeout=30)
+    click(app, "LLMで目次を解析")
+    assert calls == [(data, [2, 3])]
+
+    app.checkbox(key="reference_enabled").check()
+    app.number_input(key="reference_pdf_page").set_value(4)
+    click(app, "ページ対応の設定を反映")
+    click(app, "自動ページ照合を実行")
+    assert [e.pdf_page for e in app.session_state["entries"]] == [4, 5]
+    assert all(e.status == "Estimated" for e in app.session_state["entries"])
+    click(app, "ブックマーク付きPDFを生成")
+    output = app.session_state["output_pdf"]
+    with (
+        pymupdf.open(stream=data, filetype="pdf") as original,
+        pymupdf.open(stream=output, filetype="pdf") as result,
+    ):
+        assert result.get_toc() == [[1, "Foundations", 4], [2, "Methods", 5]]
+        assert result.page_count == original.page_count
+        for a, b in zip(original, result, strict=True):
+            assert a.read_contents() == b.read_contents()
+            assert a.get_images() == b.get_images()
+            assert not b.get_text().strip()
+    assert len(calls) == 1
+    previous = app.session_state["entries"]
+
+    def fail(self, data, pages):
+        raise TocParseError("画像解析エラー")
+
+    monkeypatch.setattr(DeepSeekTocParser, "parse_pdf_images", fail)
+    click(app, "LLMで目次を解析")
+    assert app.session_state["entries"] == previous
+    assert app.session_state["output_pdf"] == output
+    assert any("画像解析エラー" in e.value for e in app.error)
+
+
+def test_image_mode_uses_selected_toc_and_provider_switch_uses_text(make_image_pdf, monkeypatch):
+    from pdfbookmark.llm import OpenAITocParser
+
+    with pymupdf.open(stream=make_image_pdf(pages=5), filetype="pdf") as doc:
+        doc[0].insert_text((55, 140), "A text contents page")
+        data = doc.tobytes()
+    app = AppTest.from_file(str(APP))
+    app.session_state["demo_data"] = data
+    app.run(timeout=30)
+    assert app.session_state["index"].text_page_count == 1
+    assert app.radio(key="toc_input_mode").value == "画像"
+    app.number_input(key="range_first").set_value(1)
+    app.number_input(key="range_last").set_value(1)
+    click(app, "目次ページを設定")
+    assert app.session_state["toc_pages"] == [1]
+    assert app.radio(key="toc_input_mode").value == "テキスト"
+    app.text_area(key="toc_text").set_value("Edited contents").run(timeout=30)
+    app.radio(key="toc_input_mode").set_value("画像").run(timeout=30)
+    app.radio(key="toc_input_mode").set_value("テキスト").run(timeout=30)
+    assert app.text_area(key="toc_text").value == "Edited contents"
+
+    calls = []
+
+    def parse(self, text):
+        calls.append(text)
+        return demo_entries()
+
+    def image_parse(self, data, pages):
+        raise AssertionError("OpenAI must not use the DeepSeek image API")
+
+    monkeypatch.setattr(OpenAITocParser, "parse", parse)
+    monkeypatch.setattr(DeepSeekTocParser, "parse_pdf_images", image_parse)
+    app.radio(key="toc_input_mode").set_value("画像").run(timeout=30)
+    app.selectbox(key="llm_provider").select("OpenAI").run(timeout=30)
+    app.text_input(key="OPENAI_api_key").set_value("unit-test-key").run(timeout=30)
+    click(app, "LLMで目次を解析")
+    assert calls == ["Edited contents"]
 
 
 def test_llm_action_sends_only_selected_toc_and_keeps_results_on_error(monkeypatch):
@@ -243,6 +337,6 @@ def test_toc_range_change_clears_overlapping_reference(make_pdf):
     app.number_input(key="reference_pdf_page").set_value(12)
     click(app, "ページ対応の設定を反映")
     app.number_input(key="range_last").set_value(12)
-    click(app, "この範囲の目次テキストを抽出")
+    click(app, "目次ページを設定")
     assert app.session_state["page_reference"] is None
     assert not app.session_state["reference_enabled"]
