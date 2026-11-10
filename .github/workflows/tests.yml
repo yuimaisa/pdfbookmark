@@ -17,3 +17,24 @@ jobs:
           locked: true
           cache: true
       - run: pixi run --locked -e ${{ matrix.environment }} check
+  local-ocr:
+    # Separate from the offline unit suite. Only small pinned tessdata_fast
+    # language files are downloaded; Paddle's large models use the opt-in workflow.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      RUN_OCR_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        with:
+          pixi-version: v0.84.1
+          environments: ocr
+          locked: true
+          cache: true
+      - run: pixi run --locked -e ocr ocr-setup
+      - run: pixi run --locked -e ocr test-ocr

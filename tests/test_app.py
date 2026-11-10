@@ -229,3 +229,103 @@ def test_toc_range_change_clears_overlapping_reference(make_pdf):
     click(app, "この範囲の目次テキストを抽出")
     assert app.session_state["page_reference"] is None
     assert not app.session_state["reference_enabled"]
+
+
+def test_image_pdf_vision_ui_sends_only_toc_and_preserves_results_on_error(
+    make_image_pdf, monkeypatch
+):
+    calls = []
+
+    def parse(self, data, pages):
+        calls.append((data, pages))
+        return demo_entries()
+
+    monkeypatch.setattr(DeepSeekTocParser, "parse_pdf_images", parse)
+    data = make_image_pdf(pages=5)
+    app = AppTest.from_file(str(APP))
+    app.session_state["demo_data"] = data
+    app.run(timeout=30)
+    assert not app.exception
+    assert app.radio(key="toc_input_mode").value == "画像"
+    app.sidebar.text_input[0].set_value("unit-test-key").run(timeout=30)
+    click(app, "LLMで目次を解析")
+    assert calls == [(data, [2, 3])]
+    previous = app.session_state["entries"]
+
+    def fail(self, data, pages):
+        raise TocParseError("画像解析エラー")
+
+    monkeypatch.setattr(DeepSeekTocParser, "parse_pdf_images", fail)
+    click(app, "LLMで目次を解析")
+    assert app.session_state["entries"] == previous
+    assert any("画像解析エラー" in e.value for e in app.error)
+
+
+def test_image_ocr_ui_cache_restart_and_no_work_on_editor_rerun(
+    make_image_pdf, tmp_path, monkeypatch
+):
+    from pdfbookmark.ocr import OcrLine, TesseractEngine
+
+    monkeypatch.setenv("PDFBOOKMARK_CACHE_DIR", str(tmp_path))
+    calls = []
+
+    def setup(self):
+        self.model_version = "test-stable-model"
+
+    def recognize(self, png):
+        calls.append(png[:8])
+        n = len(calls)
+        if n in (4, 5):
+            return [
+                OcrLine("Foundations" if n == 4 else "Methods", (100, 200, 900, 260), 0.99, 0),
+                OcrLine(str(n - 3), (800, 2250, 860, 2300), 0.99, 1),
+            ]
+        return []
+
+    monkeypatch.setattr(TesseractEngine, "__init__", setup)
+    monkeypatch.setattr(TesseractEngine, "recognize", recognize)
+    data = make_image_pdf(pages=5)
+    for attempt in range(2):
+        app = AppTest.from_file(str(APP))
+        app.session_state["demo_data"] = data
+        app.run(timeout=30)
+        app.session_state["entries"] = [
+            Bookmark(level=1, title="Foundations", printed_page="1"),
+            Bookmark(level=2, title="Methods", printed_page="2"),
+        ]
+        app.run(timeout=30)
+        app.selectbox(key="ocr_mode").select("全文OCR").run(timeout=30)
+        click(app, "OCRを実行・再開")
+        assert len(calls) == 5
+        assert not app.session_state["ocr_plan"].active
+        assert app.session_state["ocr_plan"].completed == 5
+        assert app.session_state["ocr_plan"].cache_hits == (5 if attempt else 0)
+        app.selectbox(key="review_filter").select("未解決のみ").run(timeout=30)
+        assert not app.exception and len(calls) == 5
+
+
+def test_ocr_job_can_be_stopped_without_discarding_pending_pages(make_image_pdf, monkeypatch):
+    import streamlit
+
+    import pdfbookmark.ocr
+    from pdfbookmark.ocr import OcrBatch
+    from pdfbookmark.ocr_workflow import OcrPlan
+
+    app = AppTest.from_file(str(APP))
+    app.session_state["demo_data"] = make_image_pdf(pages=5)
+    app.run(timeout=30)
+    app.session_state["entries"] = [Bookmark(level=1, title="Absent", printed_page="1")]
+    app.run(timeout=30)
+    # Render an active batch boundary without automatically advancing the job.
+    monkeypatch.setattr(
+        pdfbookmark.ocr, "ocr_pages", lambda data, index, *a, **kw: OcrBatch(index, [], [], 0)
+    )
+    monkeypatch.setattr(streamlit, "rerun", lambda: None)
+    app.session_state["ocr_plan"] = OcrPlan(pending=[4, 5], active=True)
+    app.session_state["ocr_engine"] = object()
+    app.run(timeout=30)
+    button = next(b for b in app.button if b.label == "OCRを中断")
+    button.click().run(timeout=30)
+    assert not app.exception
+    assert not app.session_state["ocr_plan"].active
+    assert app.session_state["ocr_plan"].pending == [4, 5]

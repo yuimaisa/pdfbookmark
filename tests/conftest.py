@@ -29,3 +29,38 @@ def make_pdf():
             return doc.tobytes()
 
     return make
+
+
+@pytest.fixture
+def make_image_pdf():
+    """Rasterize generated pages and assert that no extractable text survives."""
+
+    def make(headings=None, *, pages=4, printed=None, rotation=0):
+        headings, printed = headings or {}, printed or {}
+        with pymupdf.open() as output:
+            images = {}
+            for n in range(1, pages + 1):
+                title = headings.get(n, "")
+                label = printed.get(n, "")
+                key = title, label
+                page = output.new_page(width=595, height=842)
+                if key not in images:
+                    with pymupdf.open() as source:
+                        leaf = source.new_page(width=595, height=842)
+                        if title:
+                            leaf.insert_text((55, 140), title, fontsize=26, fontname="japan")
+                        if label:
+                            leaf.insert_text((290, 815), label, fontsize=18)
+                        png = leaf.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False).tobytes(
+                            "png"
+                        )
+                    images[key] = page.insert_image(page.rect, stream=png)
+                else:
+                    page.insert_image(page.rect, xref=images[key])
+                page.set_rotation(rotation)
+            data = output.tobytes()
+        with pymupdf.open(stream=data, filetype="pdf") as checked:
+            assert all(not p.get_text().strip() and p.get_images() for p in checked)
+        return data
+
+    return make
