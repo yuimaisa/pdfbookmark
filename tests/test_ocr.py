@@ -325,3 +325,28 @@ def test_corrupt_database_and_cache_write_errors_are_safe(make_image_pdf, tmp_pa
     # Storage failures stop the job instead of repeatedly OCRing every page.
     with pytest.raises(OcrCacheError):
         ocr_pages(data, extract_index(data), FakeEngine(), OcrSettings(), cache, [1])
+
+
+def test_model_setup_succeeds_with_non_utf8_console(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    from pdfbookmark.ocr_setup import TESSDATA_REVISION
+
+    directory = tmp_path / "日本語" / "tessdata" / TESSDATA_REVISION
+    directory.mkdir(parents=True)
+    for lang in ("jpn", "eng"):
+        (directory / f"{lang}.traineddata").write_bytes(b"existing test model")
+    result = subprocess.run(
+        [sys.executable, "-m", "pdfbookmark.ocr_setup"],
+        env={
+            **os.environ,
+            "PDFBOOKMARK_CACHE_DIR": str(tmp_path / "日本語"),
+            "PYTHONIOENCODING": "cp1252",
+        },
+        capture_output=True,
+        timeout=20,
+    )
+    assert result.returncode == 0
+    assert b"ready" in result.stdout

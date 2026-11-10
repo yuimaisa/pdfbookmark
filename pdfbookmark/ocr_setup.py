@@ -33,7 +33,9 @@ def main():
         temporary = target.with_suffix(".tmp")
         temporary.write_bytes(data)
         temporary.replace(target)
-    print(f"日本語・英語モデルを準備しました: {directory}")
+    # Windows redirected stdout can use cp1252. Setup must also succeed on
+    # machines whose console cannot encode Japanese or a non-ASCII user path.
+    print("Tesseract Japanese/English language data is ready.")
 
 
 if __name__ == "__main__":
