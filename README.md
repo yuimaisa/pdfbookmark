@@ -4,19 +4,19 @@ OCR済み書籍PDFの目次をDeepSeekで構造化し、本文見出しと照合
 
 ## セットアップ・起動
 
-Python **3.11以上**を使って、リポジトリのルートで実行します。
+[pixi](https://pixi.sh/latest/installation/) **0.84.1以上**をインストールし、リポジトリのルートで実行します。Pythonと依存パッケージはpixiが用意するため、事前のPythonインストールや仮想環境の有効化は不要です。既定環境はPython **3.12**です。
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -e '.[dev]'
+pixi install --locked
 # 初回のみ。既存の .env がある場合はコピーせず、下記の設定を追記
 cp .env.example .env
 # .env の DEEPSEEK_API_KEY を設定してから起動
-streamlit run app.py
+pixi run start
 ```
 
-Windows PowerShellでは仮想環境を `.venv\Scripts\Activate.ps1` で有効化し、`Copy-Item .env.example .env` で設定ファイルを作成してください。利用だけの場合、依存関係のインストールは `python -m pip install -e .` でも構いません。
+Windows PowerShellでは、設定ファイルのコピーに `Copy-Item .env.example .env` を使います。インストール・起動コマンドは共通です。Linux、macOS（Apple Silicon / Intel）、Windowsの環境をロックしています。
+
+依存関係は `pyproject.toml`、解決済みのバージョンは `pixi.lock` で管理します。両方をGitに含め、依存関係を変更した場合は `pixi lock` でロックファイルを更新してください。環境は `.pixi/` に作成され、Git管理外です。従来の `.venv` を有効化している場合は `deactivate` してからpixiに切り替えてください。
 
 ブラウザで <http://127.0.0.1:8501> を開きます。初期設定はローカル接続のみです。APIの利用料が発生します。
 
@@ -96,10 +96,16 @@ APIを使わず、次の目次JSONだけをインポートして照合するこ�
 ## テスト
 
 ```bash
-pytest -m 'not integration'
-ruff check .
-ruff format --check .
+pixi run check
+# 個別に実行する場合
+pixi run test
+pixi run lint
+pixi run format-check
+# 自動整形
+pixi run format
 ```
+
+`check` はlint・整形チェック・通常テストをまとめて実行します。Python 3.11 / 3.13でも確認する場合は、それぞれ `pixi run -e py311 check` / `pixi run -e py313 check` を使います。CIでは同じ3環境を `--locked` で実行し、ロックファイルと依存定義のずれを検出します。
 
 テスト時にPDFをプログラムで生成します。実際の書籍やAPIキーは不要です。単純・区間別オフセット、章扉、重複見出し、表記揺れ・軽微なOCR誤認、ローマ数字・付録、複数目次ページ、未発見項目、誤アンカー、柱・相互参照、途中開始の見出し、フィルター付き編集、JSON復元、既存アウトライン確認、出力の内容保持を検証します。Streamlit AppTestで500ページの読込→照合→生成を通します。GitHub ActionsはPython 3.11 / 3.12 / 3.13でこのテストを実行します。
 
@@ -107,17 +113,17 @@ API呼び出しの通常テストは偽クライアントとHTTPモックを使�
 
 ```bash
 # .env または環境変数に DEEPSEEK_API_KEY を設定してから実行（API利用料が発生）
-RUN_DEEPSEEK_TESTS=1 pytest tests/test_deepseek_integration.py -m integration -q
+RUN_DEEPSEEK_TESTS=1 pixi run test-deepseek
 ```
 
 この接続テストは人工的な3項目の日本語目次だけを送信し、階層・見出し・印刷ページを検証します。実際のPDF本文は送りません。PowerShellでは次のように実行します。
 
 ```powershell
 $env:RUN_DEEPSEEK_TESTS = "1"
-pytest tests/test_deepseek_integration.py -m integration -q
+pixi run test-deepseek
 ```
 
-APIキー未設定、または `RUN_DEEPSEEK_TESTS=1` が未指定ならスキップします。OpenAIの任意接続テストは `RUN_OPENAI_TESTS=1 pytest tests/test_openai_integration.py -m integration` で実行できます（`OPENAI_API_KEY` 環境変数が必要）。
+APIキー未設定、または `RUN_DEEPSEEK_TESTS=1` が未指定ならスキップします。OpenAIの任意接続テストは `RUN_OPENAI_TESTS=1 pixi run test-openai` で実行できます（`OPENAI_API_KEY` 環境変数が必要）。
 
 ### DeepSeekに接続できない場合
 
@@ -135,6 +141,8 @@ APIキー未設定、または `RUN_DEEPSEEK_TESTS=1` が未指定ならスキ�
 ## 構成
 
 ```text
+pyproject.toml                Python依存定義・pixi環境・実行タスク
+pixi.lock                     各OS・Python環境の依存バージョン固定
 app.py                        日本語Streamlit UI・セッション・メモリキャッシュ
 pdfbookmark/pdf.py            PDF抽出・位置情報・オンデマンドプレビュー
 pdfbookmark/llm.py            TocParser・DeepSeek JSON出力・OpenAI Structured Outputs
