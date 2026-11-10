@@ -3,7 +3,9 @@ from pathlib import Path
 from streamlit.testing.v1 import AppTest
 
 from pdfbookmark.demo import demo_entries
+from pdfbookmark.export import export_project, import_project
 from pdfbookmark.llm import DeepSeekTocParser, TocParseError
+from pdfbookmark.models import Bookmark, PageReference
 
 APP = Path(__file__).resolve().parents[1] / "app.py"
 
@@ -128,3 +130,102 @@ def test_openai_key_does_not_enable_deepseek_action(monkeypatch):
     app = AppTest.from_file(str(APP)).run(timeout=30)
     click(app, "500ページのサンプルPDFで試す")
     assert next(b for b in app.button if b.label == "LLMで目次を解析").disabled
+
+
+def test_first_page_reference_ui_estimates_and_invalidates_old_results(make_pdf):
+    app = AppTest.from_file(str(APP))
+    app.session_state["demo_data"] = make_pdf()
+    app.run(timeout=30)
+    app.session_state["entries"] = [
+        Bookmark(level=1, title="Missing first chapter", printed_page="1"),
+        Bookmark(level=1, title="Missing later chapter", printed_page="20"),
+    ]
+    app.run(timeout=30)
+    app.checkbox(key="reference_enabled").check()
+    app.number_input(key="reference_pdf_page").set_value(12)
+    click(app, "ページ対応の設定を反映")
+    click(app, "自動ページ照合を実行")
+    assert [e.pdf_page for e in app.session_state["entries"]] == [12, 31]
+    assert all(e.status == "Estimated" for e in app.session_state["entries"])
+    click(app, "ブックマーク付きPDFを生成")
+    assert app.session_state["output_pdf"].startswith(b"%PDF")
+    # Reapplying identical settings keeps the current results and download valid.
+    click(app, "ページ対応の設定を反映")
+    assert "output_pdf" in app.session_state
+    app.number_input(key="reference_pdf_page").set_value(13)
+    click(app, "ページ対応の設定を反映")
+    assert all(e.pdf_page is None for e in app.session_state["entries"])
+    assert "output_pdf" not in app.session_state
+    assert "match_report" not in app.session_state
+    click(app, "自動ページ照合を実行")
+    assert [e.pdf_page for e in app.session_state["entries"]] == [13, 32]
+    app.checkbox(key="reference_enabled").uncheck()
+    click(app, "ページ対応の設定を反映")
+    click(app, "自動ページ照合を実行")
+    assert all(e.status == "Unresolved" for e in app.session_state["entries"])
+
+
+def test_invalid_reference_keeps_results_and_changes_preserve_manual_entries(make_pdf):
+    app = AppTest.from_file(str(APP))
+    app.session_state["demo_data"] = make_pdf()
+    app.run(timeout=30)
+    manual = Bookmark(
+        level=1, title="Manual", printed_page="1", pdf_page=12, manual=True, status="Probable"
+    )
+    app.session_state["entries"] = [manual]
+    app.run(timeout=30)
+    click(app, "ブックマーク付きPDFを生成")
+    app.checkbox(key="reference_enabled").check()
+    app.number_input(key="reference_pdf_page").set_value(2)
+    click(app, "ページ対応の設定を反映")
+    assert any("目次以外" in e.value for e in app.error)
+    assert app.session_state["entries"] == [manual]
+    assert "output_pdf" in app.session_state
+    assert "page_reference" not in app.session_state
+    app.number_input(key="reference_pdf_page").set_value(12)
+    click(app, "ページ対応の設定を反映")
+    assert app.session_state["entries"] == [manual]
+    assert "output_pdf" not in app.session_state
+
+
+def test_restored_reference_populates_ui_and_is_cleared_for_another_pdf(make_pdf):
+    data = make_pdf()
+    reference = PageReference(printed_page="1", pdf_page=12)
+    text = export_project(
+        data,
+        60,
+        [1, 2],
+        [Bookmark(level=1, title="Missing chapter", printed_page="20")],
+        page_reference=reference,
+    )
+    app = AppTest.from_file(str(APP))
+    app.session_state["demo_data"] = data
+    app.run(timeout=30)
+    app.session_state["pending_project"] = import_project(text, data, 60)
+    app.run(timeout=30)
+    assert not app.exception
+    assert app.checkbox(key="reference_enabled").value
+    assert app.number_input(key="reference_pdf_page").value == 12
+    assert app.text_input(key="reference_printed_page").value == "1"
+    click(app, "自動ページ照合を実行")
+    assert app.session_state["entries"][0].pdf_page == 31
+    app.session_state["demo_data"] = make_pdf({4: ["A different book"]}, pages=10)
+    app.run(timeout=30)
+    assert not app.exception
+    assert "page_reference" not in app.session_state
+    assert "reference_pdf_page" not in app.session_state
+
+
+def test_toc_range_change_clears_overlapping_reference(make_pdf):
+    app = AppTest.from_file(str(APP))
+    app.session_state["demo_data"] = make_pdf()
+    app.run(timeout=30)
+    app.session_state["entries"] = [Bookmark(level=1, title="Missing chapter", printed_page="1")]
+    app.run(timeout=30)
+    app.checkbox(key="reference_enabled").check()
+    app.number_input(key="reference_pdf_page").set_value(12)
+    click(app, "ページ対応の設定を反映")
+    app.number_input(key="range_last").set_value(12)
+    click(app, "この範囲の目次テキストを抽出")
+    assert app.session_state["page_reference"] is None
+    assert not app.session_state["reference_enabled"]

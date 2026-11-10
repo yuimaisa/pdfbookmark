@@ -1,5 +1,7 @@
+import pytest
+
 from pdfbookmark.matching import Anchor, PageMap, match_entries
-from pdfbookmark.models import Bookmark, TocEntry
+from pdfbookmark.models import Bookmark, PageReference, TocEntry
 from pdfbookmark.normalization import normalize, printed_number, split_heading
 from pdfbookmark.pdf import extract_index, toc_text
 
@@ -234,3 +236,96 @@ def test_normalization_and_number_domains():
     assert printed_number("xiv") == ("roman", 14)
     assert printed_number("Ａ−１") == ("appendix:A", 1)
     assert printed_number("12b") is None
+
+
+def test_explicit_first_page_reference_estimates_without_detected_headings(make_pdf):
+    index = extract_index(make_pdf())
+    reference = PageReference(printed_page="1", pdf_page=12)
+    report = match_entries(
+        index,
+        [entry("Absent first chapter", "1"), entry("Absent later section", "20")],
+        {1, 2},
+        page_reference=reference,
+    )
+    assert [e.pdf_page for e in report.entries] == [12, 31]
+    assert all(e.status == "Estimated" for e in report.entries)
+    assert all("手動指定の基準" in e.reasons[0] for e in report.entries)
+    assert report.anchor_count == 0
+    assert report.page_map.segments[0].reference
+
+
+@pytest.mark.parametrize("printed, later", [("i", "iii"), ("Ａ−１", "A-3"), ("５", "7")])
+def test_reference_keeps_numbering_domains_separate(printed, later):
+    page_map = PageMap([], PageReference(printed_page=printed, pdf_page=12))
+    assert page_map.predict(later)[0] == 14
+    assert page_map.predict("B-3")[0] is None
+
+
+def test_arabic_reference_does_not_apply_to_front_matter_or_appendix():
+    page_map = PageMap([], PageReference(printed_page="1", pdf_page=12))
+    assert page_map.predict("iii")[0] is None
+    assert page_map.predict("A-3")[0] is None
+
+
+def test_reference_and_later_headings_detect_offset_change(make_pdf):
+    report = match_entries(
+        extract_index(make_pdf({31: ["Later chapter"], 41: ["Final chapter"]})),
+        [
+            entry("Missing first chapter", "1"),
+            entry("Missing transition", "10"),
+            entry("Later chapter", "20"),
+            entry("Missing later section", "25"),
+            entry("Final chapter", "30"),
+        ],
+        {1, 2},
+        page_reference=PageReference(printed_page="1", pdf_page=11),
+    )
+    assert [e.pdf_page for e in report.entries] == [11, None, 31, 36, 41]
+    assert [e.status for e in report.entries] == [
+        "Estimated",
+        "Unresolved",
+        "Verified",
+        "Estimated",
+        "Verified",
+    ]
+    assert any("切替位置は未確定" in warning for warning in report.warnings)
+
+
+def test_isolated_heading_conflict_blocks_reference_extrapolation(make_pdf):
+    report = match_entries(
+        extract_index(make_pdf({35: ["Detected chapter"]})),
+        [entry("Detected chapter", "20"), entry("Missing last chapter", "25")],
+        {1, 2},
+        page_reference=PageReference(printed_page="1", pdf_page=11),
+    )
+    assert report.entries[0].pdf_page == 35
+    assert report.entries[0].status == "Verified"
+    assert report.entries[1].status == "Unresolved"
+    assert report.warnings
+
+
+def test_reference_does_not_estimate_outside_pdf_or_into_toc(make_pdf):
+    report = match_entries(
+        extract_index(make_pdf()),
+        [entry("Before body", "1"), entry("Past end", "100")],
+        {1, 2},
+        page_reference=PageReference(printed_page="12", pdf_page=12),
+    )
+    assert all(e.status == "Unresolved" for e in report.entries)
+
+
+@pytest.mark.parametrize("page", [1, 61])
+def test_reference_location_is_validated_before_matching(make_pdf, page):
+    with pytest.raises(ValueError, match="基準のPDFページ"):
+        match_entries(
+            extract_index(make_pdf()),
+            [entry("Missing", "1")],
+            {1, 2},
+            page_reference=PageReference(printed_page="1", pdf_page=page),
+        )
+
+
+@pytest.mark.parametrize("printed", ["", " ", "12b", "Introduction"])
+def test_reference_rejects_unusable_printed_page(printed):
+    with pytest.raises(ValueError):
+        PageReference(printed_page=printed, pdf_page=12)

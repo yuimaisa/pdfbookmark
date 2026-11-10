@@ -5,6 +5,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from pdfbookmark.normalization import printed_number
+
 Status = Literal["Verified", "Probable", "Estimated", "Unresolved"]
 
 
@@ -66,6 +68,29 @@ class Bookmark(TocEntry):
     manual: bool = False
 
 
+class PageReference(BaseModel):
+    """A user-confirmed correspondence, independent of heading detection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    printed_page: str = Field(min_length=1)
+    pdf_page: int = Field(ge=1, strict=True)
+
+    @field_validator("printed_page")
+    @classmethod
+    def valid_printed_page(cls, value: str) -> str:
+        value = value.strip()
+        if printed_number(value) is None:
+            raise ValueError("基準の印刷ページは数字・ローマ数字・付録番号で指定してください")
+        return value
+
+    def validate_location(self, page_count: int, toc_pages: list[int] | set[int]) -> None:
+        if self.pdf_page > page_count:
+            raise ValueError("基準のPDFページが範囲外です")
+        if self.pdf_page in toc_pages:
+            raise ValueError("基準のPDFページには目次以外のページを指定してください")
+
+
 class Project(BaseModel):
     model_config = ConfigDict(extra="forbid")
     version: Literal[1] = 1
@@ -73,6 +98,7 @@ class Project(BaseModel):
     page_count: int = Field(ge=1)
     toc_pages: list[int] = Field(min_length=1)
     entries: list[Bookmark] = Field(max_length=10000)
+    page_reference: PageReference | None = None
 
     @model_validator(mode="after")
     def valid_pages(self) -> Project:
@@ -84,4 +110,6 @@ class Project(BaseModel):
             raise ValueError("移動先のPDFページが範囲外です")
         if len({e.id for e in self.entries}) != len(self.entries):
             raise ValueError("項目IDが重複しています")
+        if self.page_reference is not None:
+            self.page_reference.validate_location(self.page_count, self.toc_pages)
         return self

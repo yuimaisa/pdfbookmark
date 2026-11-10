@@ -1,3 +1,4 @@
+import json
 from hashlib import sha256
 
 import pymupdf
@@ -6,7 +7,7 @@ import pytest
 from pdfbookmark.demo import demo_entries, demo_pdf
 from pdfbookmark.export import export_pdf, export_project, import_project
 from pdfbookmark.matching import match_entries
-from pdfbookmark.models import Bookmark
+from pdfbookmark.models import Bookmark, PageReference
 from pdfbookmark.pdf import extract_index, render_page
 
 
@@ -103,3 +104,25 @@ def test_500_page_complete_deterministic_pipeline():
     assert all(e.status == "Verified" for e in report.entries)
     output = export_pdf(data, report.entries)
     assert len(extract_index(output).existing_toc) == 9
+
+
+def test_project_preserves_reference_and_reads_older_json(make_pdf):
+    data = make_pdf()
+    reference = PageReference(printed_page="1", pdf_page=12)
+    text = export_project(data, 60, [1, 2], [bookmark()], page_reference=reference)
+    assert import_project(text, data, 60).page_reference == reference
+    older = json.loads(text)
+    older.pop("page_reference")
+    assert import_project(json.dumps(older), data, 60).page_reference is None
+
+
+@pytest.mark.parametrize("page", [1, 61])
+def test_project_rejects_invalid_reference_location(make_pdf, page):
+    with pytest.raises(ValueError, match="基準のPDFページ"):
+        export_project(
+            make_pdf(),
+            60,
+            [1, 2],
+            [bookmark()],
+            page_reference=PageReference(printed_page="1", pdf_page=page),
+        )
