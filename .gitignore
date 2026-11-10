@@ -9,6 +9,10 @@ __pycache__/
 .env.*
 !.env.example
 .streamlit/secrets.toml
+# Keep exported projects and private credentials out of public commits.
+*.bookmarks.json
+*.pem
+*.key
 *.pdf
 *.png
 *.webm
