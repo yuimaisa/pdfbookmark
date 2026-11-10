@@ -16,9 +16,6 @@ class TextLine:
     bbox: tuple[float, float, float, float]
     size: float
     block: int
-    source: str = "text"
-    confidence: float = 1.0
-    order: int = 0
 
 
 @dataclass(frozen=True)
@@ -29,7 +26,6 @@ class PageText:
     width: float
     height: float
     lines: tuple[TextLine, ...]
-    source: str = "text"
 
 
 @dataclass(frozen=True)
@@ -62,7 +58,7 @@ def open_pdf(data: bytes) -> pymupdf.Document:
 
 
 def extract_index(data: bytes, progress: Callable[[float], None] | None = None) -> PdfIndex:
-    """Extract the text layer once, leaving image-only pages for the OCR adapter."""
+    """Extract the existing text layer once, without rendering or disk copies."""
     pages = []
     with open_pdf(data) as doc:
         existing = tuple(tuple(row) for row in doc.get_toc())
