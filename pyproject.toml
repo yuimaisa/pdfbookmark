@@ -25,7 +25,7 @@ include = ["pdfbookmark*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: opt-in live OpenAI API tests (costs money)"]
+markers = ["integration: opt-in live LLM API tests (costs money)"]
 
 [tool.ruff]
 line-length = 100

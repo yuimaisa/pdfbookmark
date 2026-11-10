@@ -13,12 +13,18 @@ from pydantic import ValidationError
 from pdfbookmark.demo import demo_entries, demo_pdf
 from pdfbookmark.editing import merge_edits
 from pdfbookmark.export import export_pdf, export_project, import_project
-from pdfbookmark.llm import OpenAITocParser, TocParseError, validate_toc_json
+from pdfbookmark.llm import (
+    DEEPSEEK_DEFAULT_MODEL,
+    DeepSeekTocParser,
+    OpenAITocParser,
+    TocParseError,
+    validate_toc_json,
+)
 from pdfbookmark.matching import match_entries
 from pdfbookmark.models import Bookmark
 from pdfbookmark.pdf import extract_index, render_page, toc_text
 
-load_dotenv()
+load_dotenv(Path(__file__).with_name(".env"))
 st.set_page_config(page_title="pdfbookmark | 目次からブックマークへ", page_icon="📖", layout="wide")
 
 
@@ -64,16 +70,29 @@ def main():
         notice.success(message)
     with st.sidebar:
         st.header("目次解析の設定")
+        provider = st.selectbox("LLMプロバイダー", ["DeepSeek", "OpenAI"], key="llm_provider")
+        parser_class = DeepSeekTocParser if provider == "DeepSeek" else OpenAITocParser
+        prefix = provider.upper()
         api_key = st.text_input(
-            "OpenAI APIキー", type="password", value=os.getenv("OPENAI_API_KEY", "")
+            f"{provider} APIキー",
+            type="password",
+            value=os.getenv(f"{prefix}_API_KEY", ""),
+            key=f"{prefix}_api_key",
         )
-        model = st.text_input("モデル", value=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
-        st.caption("Structured Outputs対応モデルを指定してください。")
+        default_model = DEEPSEEK_DEFAULT_MODEL if provider == "DeepSeek" else "gpt-4.1-mini"
+        model = st.text_input(
+            "モデル", value=os.getenv(f"{prefix}_MODEL") or default_model, key=f"{prefix}_model"
+        )
+        if provider == "DeepSeek":
+            st.caption("DeepSeekのJSON出力で解析します。推論モードは無効です。")
+        else:
+            st.caption("Structured Outputs対応モデルを指定してください。")
         st.info(
-            "APIに送信するのは、画面で確認した目次テキストだけです。本文の照合はローカルで行います。"
+            f"{provider}に送信するのは、画面で確認した目次テキストだけです。"
+            "本文の照合はローカルで行います。"
         )
         st.caption(
-            "PDF・抽出テキスト・APIキーはファイルやログに保存しません。"
+            "入力したAPIキー・PDF・抽出テキストをアプリからファイルやログに保存しません。"
             "中間JSONには見出しが含まれます。"
         )
         st.markdown("**状態の読み方**")
@@ -182,7 +201,7 @@ def main():
     if st.button("LLMで目次を解析", type="primary", disabled=not bool(api_key.strip())):
         try:
             with st.spinner("目次を解析しています…"):
-                parsed = OpenAITocParser(api_key, model).parse(st.session_state.toc_text)
+                parsed = parser_class(api_key, model).parse(st.session_state.toc_text)
             replace_entries([Bookmark(**e.model_dump()) for e in parsed.entries])
             st.success(f"目次を{len(parsed.entries)}件抽出しました。")
         except (TocParseError, ValueError) as exc:

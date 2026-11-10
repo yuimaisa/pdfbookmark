@@ -1,6 +1,6 @@
 # pdfbookmark
 
-OCR済み書籍PDFの目次をLLMで構造化し、本文見出しと照合して階層付きブックマークを生成するローカルWebアプリです。日本語UI、500〜1000ページ程度の教科書・専門書を想定しています。
+OCR済み書籍PDFの目次をDeepSeekで構造化し、本文見出しと照合して階層付きブックマークを生成するローカルWebアプリです。日本語UI、500〜1000ページ程度の教科書・専門書を想定しています。初期設定は **DeepSeek / `deepseek-flash`** です。
 
 ## セットアップ・起動
 
@@ -10,14 +10,37 @@ Python **3.11以上**を使って、リポジトリのルートで実行しま�
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
+# 初回のみ。既存の .env がある場合はコピーせず、下記の設定を追記
 cp .env.example .env
-# .env の OPENAI_API_KEY と OPENAI_MODEL を設定
+# .env の DEEPSEEK_API_KEY を設定してから起動
 streamlit run app.py
 ```
 
 Windows PowerShellでは仮想環境を `.venv\Scripts\Activate.ps1` で有効化し、`Copy-Item .env.example .env` で設定ファイルを作成してください。利用だけの場合、依存関係のインストールは `python -m pip install -e .` でも構いません。
 
-ブラウザで <http://127.0.0.1:8501> を開きます。初期設定はローカル接続のみです。画面左側からAPIキーとモデルを指定することもできます。初期モデルは `gpt-4.1-mini`、OpenAIの **Structured Outputs対応モデル**が必要です。APIの利用料が発生します。
+ブラウザで <http://127.0.0.1:8501> を開きます。初期設定はローカル接続のみです。APIの利用料が発生します。
+
+### DeepSeek APIキーの設定
+
+用意した **DeepSeekのAPIキー** を、リポジトリ直下の `.env` に設定します。APIキーはチャットやREADMEに貼らず、このローカルファイルにだけ記入してください。
+
+```dotenv
+DEEPSEEK_API_KEY=your-deepseek-api-key
+DEEPSEEK_MODEL=deepseek-flash
+```
+
+`your-deepseek-api-key` を実際のキーに置き換えます。キーの管理と残高の確認は [DeepSeek Platform](https://platform.deepseek.com/) から行えます。`.env` はGit管理外です。設定変更後はStreamlitを停止し、再起動してください。環境変数として設定済みの値は `.env` より優先されます。
+
+ファイルに保存せず使う場合は、画面左側の **LLMプロバイダーをDeepSeek** にして、「DeepSeek APIキー」欄に入力します。画面の入力値は、そのセッションで `.env` / 環境変数の値より優先されます。
+
+- 初期モデル：`deepseek-flash`。別の対応モデルを使う場合は `DEEPSEEK_MODEL` または画面の「モデル」を変更します。
+- 接続先：`https://api.deepseek.com`。DeepSeekを選択している間、目次はDeepSeekへ送信します。
+- 解析方式：JSON出力モード（`json_object`）。項目の型・必須フィールド・階層は、返答を受け取った後にPydanticでも検証します。
+- 推論モード：費用・待ち時間を抑えるため無効。出力上限は16,000トークンです。
+
+依存関係の `openai` は、DeepSeekのOpenAI互換APIを呼ぶためのPython SDKとしても使用します。DeepSeekの選択時はDeepSeekのキーと接続先を使用し、OpenAIのAPIキーは不要です。[DeepSeekのAPI仕様](https://api-docs.deepseek.com/)・[JSON出力仕様](https://api-docs.deepseek.com/guides/json_mode/)・[モデルと料金](https://api-docs.deepseek.com/quick_start/pricing/)
+
+OpenAIを使う場合は画面のプロバイダーを明示的に切り替え、`OPENAI_API_KEY` / `OPENAI_MODEL` を設定します。OpenAI側はStructured Outputs対応モデルが必要です。両プロバイダーのキーとモデル設定は分離しています。
 
 APIキーなしでも「500ページのサンプルPDFで試す」→「サンプル目次を読み込む（API不要）」から、照合・編集・PDF生成を試せます。サンプルの目次は英語ですが、アプリと見出し照合は日本語にも対応します。
 
@@ -80,19 +103,41 @@ ruff format --check .
 
 テスト時にPDFをプログラムで生成します。実際の書籍やAPIキーは不要です。単純・区間別オフセット、章扉、重複見出し、表記揺れ・軽微なOCR誤認、ローマ数字・付録、複数目次ページ、未発見項目、誤アンカー、柱・相互参照、途中開始の見出し、フィルター付き編集、JSON復元、既存アウトライン確認、出力の内容保持を検証します。Streamlit AppTestで500ページの読込→照合→生成を通します。GitHub ActionsはPython 3.11 / 3.12 / 3.13でこのテストを実行します。
 
-OpenAI呼び出しの通常テストは偽クライアントを使い、送信範囲・スキーマ・階層・失敗時の挙動を検証します。**実APIテストは明示的な有効化が必要**です。
+API呼び出しの通常テストは偽クライアントとHTTPモックを使い、DeepSeekへの送信先・JSON出力・推論無効・送信範囲・階層検証・空の応答・APIエラーを検証します。UIの初期選択とプロバイダーごとのキー分離も確認します。**実APIテストは明示的な有効化が必要**です。
 
 ```bash
-# OPENAI_API_KEYを環境変数として設定してから実行（API利用料が発生）
-RUN_OPENAI_TESTS=1 pytest -m integration
+# .env または環境変数に DEEPSEEK_API_KEY を設定してから実行（API利用料が発生）
+RUN_DEEPSEEK_TESTS=1 pytest tests/test_deepseek_integration.py -m integration -q
 ```
+
+この接続テストは人工的な3項目の日本語目次だけを送信し、階層・見出し・印刷ページを検証します。実際のPDF本文は送りません。PowerShellでは次のように実行します。
+
+```powershell
+$env:RUN_DEEPSEEK_TESTS = "1"
+pytest tests/test_deepseek_integration.py -m integration -q
+```
+
+APIキー未設定、または `RUN_DEEPSEEK_TESTS=1` が未指定ならスキップします。OpenAIの任意接続テストは `RUN_OPENAI_TESTS=1 pytest tests/test_openai_integration.py -m integration` で実行できます（`OPENAI_API_KEY` 環境変数が必要）。
+
+### DeepSeekに接続できない場合
+
+| 表示 | 対応 |
+| --- | --- |
+| HTTP 401 | DeepSeekのキーを設定したか、空白・コピー漏れがないか確認 |
+| HTTP 402 | DeepSeek PlatformでAPI残高・利用枠を確認 |
+| HTTP 429 | 利用上限や混雑の可能性があるため、時間を置いて再試行 |
+| HTTP 400など | モデル名と公式API仕様を確認。まず `deepseek-flash` を使用 |
+| 空の応答・JSON形式エラー | 目次テキストを見直して再試行。長い場合は範囲を絞る |
+| 接続エラー | インターネット接続、プロキシ、`api.deepseek.com` への通信許可を確認 |
+
+解析エラー時は既存の編集結果を保持し、不正な返答を採用しません。キーやAPIの生のエラー本文は画面・独自ログに出力しません。
 
 ## 構成
 
 ```text
 app.py                        日本語Streamlit UI・セッション・メモリキャッシュ
 pdfbookmark/pdf.py            PDF抽出・位置情報・オンデマンドプレビュー
-pdfbookmark/llm.py            TocParserプロトコル・OpenAI Structured Outputs
+pdfbookmark/llm.py            TocParser・DeepSeek JSON出力・OpenAI Structured Outputs
 pdfbookmark/models.py         目次・結果・中間JSONの検証
 pdfbookmark/normalization.py   検索用正規化・番号体系
 pdfbookmark/matching.py        見出し索引・段階的照合・区間別オフセット
@@ -102,14 +147,14 @@ pdfbookmark/demo.py            人工的な500ページ書籍
 tests/                        生成PDF・LLMモック・UI・任意の実APIテスト
 ```
 
-LLMは `TocParser.parse(text) -> TocDocument` を実装して差し替えられます。初期UIはOpenAIのみです。将来のOCRは `pdf.py` の抽出層を拡張できます。
+LLMは `TocParser.parse(text) -> TocDocument` を実装して差し替えられます。UIではDeepSeek（初期選択）とOpenAIを切り替えられます。将来のOCRは `pdf.py` の抽出層を拡張できます。
 
 ## パフォーマンス・プライバシー
 
 - 全ページの画像化はせず、テキストレイヤーを直接抽出します。プレビューは要求された1ページのみを描画します。
 - PDFごとの抽出結果をセッションで保持し、メモリキャッシュは最大2文書／1時間、プレビューは12枚／10分です。ディスク永続化はしません。ブラウザ再読込時には中間JSONから作業を復元してください。
 - LLMは明示的な目次解析操作時だけ呼び、編集や本文検索では呼びません。目次テキストは120,000文字までです。
-- 入力・出力PDFはメモリ上で処理し、PDF本文やAPIキーを独自ログ・Git・一時ファイルに保存しません。`.env`、PDF、仮想環境、キャッシュはGit管理外です。APIキーはOpenAIの認証にだけ使用します。
+- 入力・出力PDFはメモリ上で処理し、PDF本文や入力したAPIキーを独自ログ・Git・一時ファイルに保存しません。`.env`、PDF、仮想環境、キャッシュはGit管理外です。APIキーは選択したプロバイダーの認証に使用します。
 - 同時に元PDF・出力PDF・索引を保持するため、メモリ消費はファイルサイズとテキスト量に依存します。アップロードの設定上限は1GBです。極端に大きいスキャンPDFは分割して処理してください。
 
 ## 制約・既知の問題
@@ -118,7 +163,7 @@ LLMは `TocParser.parse(text) -> TocDocument` を実装して差し替えられ�
 - OCR品質や読み順に依存します。複雑な多段組、縦書き、3行を超える見出し、数式見出し、何度も同じ表題がある書籍では手動修正が必要です。テキストが存在することはOCR品質の保証ではありません。
 - ページ対応には同じ番号体系で複数の独立した強いアンカーが必要です。欠落や挿入の正確な位置が分からない場合、境界区間や孤立した新オフセットでは推定を控えます。大幅なOCR誤認、複雑な番号リセット、挿入が連続する本は手動で補ってください。
 - 見出し名だけでは区別できない参照や重複を完全には除外できません。Verifiedも絶対的な保証ではありません。
-- モデルによってStructured Outputs未対応や出力上限の差があります。エラー時はモデルや目次範囲を見直してください。長大な目次の自動分割・再試行結合は行いません。
+- DeepSeekのJSON出力はJSONの形式を指定する機能で、見出し抽出の正しさやスキーマへの適合を保証しません。Pydanticで検証しますが、抽出漏れ・見出し名・階層は確認が必要です。空白だけの返答や出力上限による未完了はエラーにします。エラー時はモデルや目次範囲を見直してください。長大な目次の自動分割・再試行結合は行いません。
 - PDFは再保存されるため電子署名を維持できません。未解決項目を残したPDF生成や、既存ブックマークとの自動マージには対応しません。
 - 本アプリは個人のローカル利用を想定しています。外部公開や複数人運用向けの認証・セッション保護は実装していません。
 - PyMuPDFのライセンスはAGPLまたは商用ライセンスです。配布・組込み時は依存ライブラリの条件を確認してください。

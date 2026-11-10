@@ -18,6 +18,16 @@ printed_pageは必ず文字列またはnullです。ローマ数字やA-1等の�
 目次に存在しない項目を創作せず、柱・ページ番号だけの行・目次という見出しを除外します。
 PDFページ区切りは本文ではありません。入力の全目次ページを順に処理してください。"""
 
+JSON_PROMPT = """
+説明やMarkdownを付けず、次の形式のJSONオブジェクトだけを出力してください。
+{"entries":[{"level":1,"title":"第1章 はじめに","printed_page":"1"},
+{"level":2,"title":"1.1 研究背景","printed_page":null}]}
+この例の項目は出力に含めず、入力の目次から抽出した項目だけを含めてください。
+各項目のキーはlevel、title、printed_pageだけです。"""
+
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-flash"
+
 
 class TocParseError(ValueError):
     pass
@@ -37,14 +47,26 @@ def validate_toc_json(text: str) -> TocDocument:
         ) from exc
 
 
-class OpenAITocParser:
-    def __init__(self, api_key: str, model: str = "gpt-4.1-mini", client=None):
+class _ChatTocParser:
+    provider: str
+    base_url: str
+    default_model: str
+
+    def __init__(self, api_key: str, model: str | None = None, client=None):
         if not api_key.strip() and client is None:
-            raise TocParseError("OpenAI APIキーを設定してください")
-        if not model.strip():
+            raise TocParseError(f"{self.provider} APIキーを設定してください")
+        model = self.default_model if model is None else model.strip()
+        if not model:
             raise TocParseError("モデル名を指定してください")
-        self.model = model.strip()
-        self.client = client or OpenAI(api_key=api_key, timeout=90, max_retries=1)
+        self.model = model
+        # Explicit endpoints keep credentials scoped to the chosen provider,
+        # regardless of another provider's OPENAI_BASE_URL environment variable.
+        self.client = client or OpenAI(
+            api_key=api_key.strip(), base_url=self.base_url, timeout=90, max_retries=1
+        )
+
+    def request_options(self) -> dict:
+        raise NotImplementedError
 
     def parse(self, text: str) -> TocDocument:
         if not text.strip():
@@ -55,37 +77,73 @@ class OpenAITocParser:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": SYSTEM_PROMPT + JSON_PROMPT},
                     {"role": "user", "content": text},
                 ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "book_toc",
-                        "strict": True,
-                        "schema": TocDocument.model_json_schema(),
-                    },
-                },
-                max_completion_tokens=16000,
+                **self.request_options(),
             )
         except (APIConnectionError, APITimeoutError) as exc:
             raise TocParseError(
-                "OpenAIへの接続が失敗しました。接続設定を確認して再試行してください"
+                f"{self.provider}への接続が失敗しました。接続設定を確認して再試行してください"
             ) from exc
         except APIStatusError as exc:
+            hint = {
+                401: "APIキーを確認してください",
+                402: "APIの残高・利用枠を確認してください",
+                429: "利用上限や混雑の可能性があります。時間を置いて再試行してください",
+            }.get(exc.status_code, "モデル名・APIの稼働状況を確認してください")
             raise TocParseError(
-                f"OpenAI APIエラー（HTTP {exc.status_code}）。"
-                "キー・利用枠・Structured Outputs対応モデルを確認してください"
+                f"{self.provider} APIエラー（HTTP {exc.status_code}）。{hint}"
             ) from exc
         except APIError as exc:
             raise TocParseError(
-                "OpenAIの応答を読み取れませんでした。モデル・接続設定を確認してください"
+                f"{self.provider}の応答を読み取れませんでした。モデル・接続設定を確認してください"
             ) from exc
         if not response.choices:
-            raise TocParseError("OpenAIから目次が返されませんでした")
+            raise TocParseError(f"{self.provider}から目次が返されませんでした")
         choice = response.choices[0]
-        if choice.finish_reason != "stop" or choice.message.refusal:
+        if choice.finish_reason != "stop" or getattr(choice.message, "refusal", None):
             raise TocParseError(
                 "目次解析が完了しませんでした（出力上限または拒否）。目次範囲を調整してください"
             )
-        return validate_toc_json(choice.message.content or "")
+        content = choice.message.content or ""
+        if not content.strip():
+            raise TocParseError(
+                f"{self.provider}から空の応答が返されました。目次テキストを調整して再試行してください"
+            )
+        return validate_toc_json(content)
+
+
+class DeepSeekTocParser(_ChatTocParser):
+    provider = "DeepSeek"
+    base_url = DEEPSEEK_BASE_URL
+    default_model = DEEPSEEK_DEFAULT_MODEL
+
+    def request_options(self) -> dict:
+        # DeepSeek Chat Completions supports json_object, not OpenAI's json_schema.
+        # Pydantic still validates all fields, types, and hierarchy after generation.
+        return {
+            "response_format": {"type": "json_object"},
+            "max_tokens": 16000,
+            "temperature": 0,
+            "extra_body": {"thinking": {"type": "disabled"}},
+        }
+
+
+class OpenAITocParser(_ChatTocParser):
+    provider = "OpenAI"
+    base_url = "https://api.openai.com/v1"
+    default_model = "gpt-4.1-mini"
+
+    def request_options(self) -> dict:
+        return {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "book_toc",
+                    "strict": True,
+                    "schema": TocDocument.model_json_schema(),
+                },
+            },
+            "max_completion_tokens": 16000,
+        }

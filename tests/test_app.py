@@ -3,7 +3,7 @@ from pathlib import Path
 from streamlit.testing.v1 import AppTest
 
 from pdfbookmark.demo import demo_entries
-from pdfbookmark.llm import OpenAITocParser, TocParseError
+from pdfbookmark.llm import DeepSeekTocParser, TocParseError
 
 APP = Path(__file__).resolve().parents[1] / "app.py"
 
@@ -56,7 +56,7 @@ def test_llm_action_sends_only_selected_toc_and_keeps_results_on_error(monkeypat
         calls.append(text)
         return demo_entries()
 
-    monkeypatch.setattr(OpenAITocParser, "parse", parse)
+    monkeypatch.setattr(DeepSeekTocParser, "parse", parse)
     app = AppTest.from_file(str(APP)).run(timeout=30)
     click(app, "500ページのサンプルPDFで試す")
     app.sidebar.text_input[0].set_value("unit-test-key").run(timeout=30)
@@ -72,7 +72,7 @@ def test_llm_action_sends_only_selected_toc_and_keeps_results_on_error(monkeypat
     def fail(self, text):
         raise TocParseError("テスト解析エラー")
 
-    monkeypatch.setattr(OpenAITocParser, "parse", fail)
+    monkeypatch.setattr(DeepSeekTocParser, "parse", fail)
     click(app, "LLMで目次を解析")
     assert app.session_state["entries"] == previous
     assert any("テスト解析エラー" in e.value for e in app.error)
@@ -104,3 +104,27 @@ def test_cached_document_can_be_opened_in_a_fresh_session(make_pdf):
         app.run(timeout=30)
         assert not app.exception
         assert app.session_state["index"].page_count == 60
+
+
+def test_deepseek_is_default_and_provider_keys_are_kept_separate(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-key")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "openai-test-model")
+    app = AppTest.from_file(str(APP)).run(timeout=30)
+    assert not app.exception
+    assert app.selectbox(key="llm_provider").value == "DeepSeek"
+    assert app.text_input(key="DEEPSEEK_api_key").value == "deepseek-test-key"
+    assert app.text_input(key="DEEPSEEK_model").value == "deepseek-v4-pro"
+    app.selectbox(key="llm_provider").select("OpenAI").run(timeout=30)
+    assert not app.exception
+    assert app.text_input(key="OPENAI_api_key").value == "openai-test-key"
+    assert app.text_input(key="OPENAI_model").value == "openai-test-model"
+
+
+def test_openai_key_does_not_enable_deepseek_action(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-test-key")
+    app = AppTest.from_file(str(APP)).run(timeout=30)
+    click(app, "500ページのサンプルPDFで試す")
+    assert next(b for b in app.button if b.label == "LLMで目次を解析").disabled
