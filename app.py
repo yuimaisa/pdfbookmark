@@ -21,7 +21,7 @@ from pdfbookmark.llm import (
     validate_toc_json,
 )
 from pdfbookmark.matching import match_entries
-from pdfbookmark.models import Bookmark
+from pdfbookmark.models import Bookmark, PageReference
 from pdfbookmark.pdf import extract_index, render_page, toc_text
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -49,6 +49,21 @@ def replace_entries(entries):
     st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
     st.session_state.pop("match_report", None)
     invalidate_output()
+
+
+def set_page_reference(reference):
+    """A changed page map invalidates automatic results, preserving manual edits."""
+    if reference == st.session_state.get("page_reference"):
+        return
+    st.session_state.page_reference = reference
+    replace_entries(
+        [
+            entry
+            if entry.manual
+            else Bookmark(**entry.model_dump(include={"id", "level", "title", "printed_page"}))
+            for entry in st.session_state.entries
+        ]
+    )
 
 
 def clear_demo():
@@ -125,7 +140,7 @@ def main():
         progress.empty()
         # Commit document state only after the new PDF was opened successfully.
         for key in list(st.session_state):
-            if key.startswith(("editor_", "preview_")) or key in {
+            if key.startswith(("editor_", "preview_", "reference_")) or key in {
                 "entries",
                 "output_pdf",
                 "match_report",
@@ -136,6 +151,7 @@ def main():
                 "overwrite",
                 "detail_entry",
                 "review_filter",
+                "page_reference",
             }:
                 del st.session_state[key]
         st.session_state.index = index
@@ -150,6 +166,13 @@ def main():
     if project := st.session_state.pop("pending_project", None):
         replace_entries(project.entries)
         st.session_state.toc_pages = project.toc_pages
+        reference = project.page_reference
+        st.session_state.page_reference = reference
+        st.session_state.reference_enabled = reference is not None
+        st.session_state.reference_pdf_page = (
+            reference.pdf_page if reference else min(index.page_count, max(project.toc_pages) + 1)
+        )
+        st.session_state.reference_printed_page = reference.printed_page if reference else "1"
         if project.toc_pages:
             first, last = min(project.toc_pages), max(project.toc_pages)
             st.session_state.range_first, st.session_state.range_last = first, last
@@ -188,6 +211,11 @@ def main():
             if pages != st.session_state.toc_pages:
                 replace_entries([])
             st.session_state.toc_pages = pages
+            reference = st.session_state.get("page_reference")
+            if reference is not None and reference.pdf_page in pages:
+                set_page_reference(None)
+                st.session_state.reference_enabled = False
+                st.warning("基準ページが目次範囲に入ったため、本文先頭のページ対応を解除しました。")
         except ValueError as exc:
             error_message(exc)
     st.caption("現在の目次PDFページ：" + ", ".join(map(str, st.session_state.toc_pages)))
@@ -230,6 +258,53 @@ def main():
         st.info("目次を解析するかJSONを読み込むと、自動照合・編集に進めます。")
         return
     st.subheader("4. 本文とページ番号を照合する")
+    st.caption(
+        "本文先頭の印刷ページがPDFの何ページ目か分かる場合は、ページ対応を指定できます。"
+        "例：印刷1ページがPDF12ページ目なら、目次の印刷ページに11を足して推定します。"
+    )
+    st.session_state.setdefault(
+        "reference_pdf_page", min(index.page_count, max(st.session_state.toc_pages) + 1)
+    )
+    st.session_state.setdefault("reference_printed_page", "1")
+    with st.form("page_reference_form"):
+        st.checkbox("本文先頭のページ対応を使う", key="reference_enabled")
+        a, b = st.columns(2)
+        a.number_input(
+            "本文先頭のPDFページ",
+            min_value=1,
+            max_value=index.page_count,
+            step=1,
+            key="reference_pdf_page",
+        )
+        b.text_input("そのページの印刷ページ番号", key="reference_printed_page")
+        st.caption("印刷ページは数字・ローマ数字・付録番号（例：1、i、A-1）に対応します。")
+        save_reference = st.form_submit_button("ページ対応の設定を反映")
+    if save_reference:
+        try:
+            reference = None
+            if st.session_state.reference_enabled:
+                reference = PageReference(
+                    pdf_page=st.session_state.reference_pdf_page,
+                    printed_page=st.session_state.reference_printed_page,
+                )
+                reference.validate_location(index.page_count, st.session_state.toc_pages)
+            set_page_reference(reference)
+            entries = st.session_state.entries
+            st.success("ページ対応の設定を反映しました。自動ページ照合を実行してください。")
+        except ValueError as exc:
+            error_message(exc)
+    reference = st.session_state.get("page_reference")
+    if reference is not None:
+        st.info(
+            f"使用中の基準：印刷ページ {reference.printed_page} → PDFページ {reference.pdf_page}。"
+            "同じ番号体系の項目に適用し、途中のずれは本文見出しとの照合で確認します。"
+        )
+        if st.checkbox("本文先頭の画像を確認", key="reference_preview"):
+            st.image(
+                cached_preview(data, reference.pdf_page),
+                caption=f"PDFページ {reference.pdf_page} / 印刷ページ {reference.printed_page}",
+                width=700,
+            )
     keep_manual = st.checkbox("再照合時に手動指定した移動先を保持", value=True)
     if st.button("自動ページ照合を実行"):
         progress = st.progress(0.0, text="本文見出しを検索し、ページ対応を推定しています…")
@@ -244,6 +319,7 @@ def main():
                 targets,
                 set(st.session_state.toc_pages),
                 progress=lambda v: progress.progress(v),
+                page_reference=reference,
             )
             replace_entries(report.entries)
             st.session_state.match_report = report
@@ -360,7 +436,13 @@ def main():
     st.subheader("6. 保存・ダウンロード")
     st.download_button(
         "中間結果JSONをダウンロード",
-        export_project(data, index.page_count, st.session_state.toc_pages, entries),
+        export_project(
+            data,
+            index.page_count,
+            st.session_state.toc_pages,
+            entries,
+            page_reference=reference,
+        ),
         file_name=f"{Path(name).stem}.bookmarks.json",
         mime="application/json",
         on_click="ignore",

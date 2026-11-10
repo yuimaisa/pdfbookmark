@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 
-from pdfbookmark.models import Bookmark, Project, validate_hierarchy
+from pdfbookmark.models import Bookmark, PageReference, Project, validate_hierarchy
 from pdfbookmark.pdf import open_pdf
 
 
@@ -31,13 +31,19 @@ def export_pdf(data: bytes, entries: list[Bookmark], *, overwrite_existing: bool
 
 
 def export_project(
-    data: bytes, page_count: int, toc_pages: list[int], entries: list[Bookmark]
+    data: bytes,
+    page_count: int,
+    toc_pages: list[int],
+    entries: list[Bookmark],
+    *,
+    page_reference: PageReference | None = None,
 ) -> str:
     project = Project(
         document_sha256=sha256(data).hexdigest(),
         page_count=page_count,
         toc_pages=toc_pages,
         entries=entries,
+        page_reference=page_reference,
     )
     return project.model_dump_json(indent=2)
 

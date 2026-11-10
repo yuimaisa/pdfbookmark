@@ -10,7 +10,7 @@ from statistics import median
 
 from rapidfuzz.fuzz import ratio
 
-from pdfbookmark.models import Bookmark, Candidate, TocEntry
+from pdfbookmark.models import Bookmark, Candidate, PageReference, TocEntry
 from pdfbookmark.normalization import normalize, printed_number, split_heading
 from pdfbookmark.pdf import PdfIndex
 
@@ -163,23 +163,39 @@ class OffsetSegment:
     last: int
     offset: int
     support: int
+    reference: bool = False
 
 
 class PageMap:
-    def __init__(self, anchors: list[Anchor]):
-        self.anchors = anchors
+    def __init__(self, anchors: list[Anchor], reference: PageReference | None = None):
+        self.reference = reference
+        reference_anchor = None
+        if reference is not None:
+            domain, number = printed_number(reference.printed_page)
+            reference_anchor = Anchor(-1, domain, number, reference.pdf_page)
+        self.anchors = anchors + ([reference_anchor] if reference_anchor else [])
         self.segments: list[OffsetSegment] = []
         self.warnings: list[str] = []
         domains: dict[str, list[Anchor]] = defaultdict(list)
-        for anchor in anchors:
+        for anchor in self.anchors:
             domains[anchor.domain].append(anchor)
         for domain, group in domains.items():
             group.sort(key=lambda a: (a.printed, a.entry))
             support: dict[int, set[int]] = defaultdict(set)
             for a in group:
                 support[a.offset].add(a.printed)
-            # One erroneous match must never establish an offset for other entries.
-            accepted = [a for a in group if len(support[a.offset]) >= 2]
+            # A single automatic match is insufficient. An explicit user reference
+            # can establish its own offset without relying on OCR'd headings.
+            accepted = [
+                a
+                for a in group
+                if len(support[a.offset]) >= 2
+                or (
+                    reference_anchor is not None
+                    and a.domain == reference_anchor.domain
+                    and a.offset == reference_anchor.offset
+                )
+            ]
             runs: list[list[Anchor]] = []
             for a in accepted:
                 if runs and runs[-1][-1].offset == a.offset:
@@ -188,10 +204,16 @@ class PageMap:
                     runs.append([a])
             for run in runs:
                 distinct = {a.printed for a in run}
-                if len(distinct) >= 2:
+                has_reference = reference_anchor is not None and reference_anchor in run
+                if len(distinct) >= 2 or has_reference:
                     self.segments.append(
                         OffsetSegment(
-                            domain, min(distinct), max(distinct), run[0].offset, len(distinct)
+                            domain,
+                            min(distinct),
+                            max(distinct),
+                            run[0].offset,
+                            len(distinct),
+                            has_reference,
                         )
                     )
             domain_segments = [s for s in self.segments if s.domain == domain]
@@ -233,10 +255,16 @@ class PageMap:
             selected = segments[-1]
         if selected is None:
             return None, "オフセット変化の境界区間で移動先を一意に推定できません"
-        return number + selected.offset, (
+        reason = (
             f"{domain}のアンカー{selected.support}件、印刷ページ"
             f"{selected.first}〜{selected.last}、オフセット{selected.offset:+d}"
         )
+        if selected.reference:
+            reason = (
+                f"手動指定の基準（印刷ページ{self.reference.printed_page} → "
+                f"PDFページ{self.reference.pdf_page}）、" + reason
+            )
+        return number + selected.offset, reason
 
 
 def monotone_anchors(anchors: list[Anchor]) -> list[Anchor]:
@@ -271,9 +299,13 @@ def match_entries(
     entries: list[TocEntry],
     toc_pages: set[int],
     progress: Callable[[float], None] | None = None,
+    *,
+    page_reference: PageReference | None = None,
 ) -> MatchReport:
     if any(p < 1 or p > index.page_count for p in toc_pages):
         raise ValueError("目次ページが範囲外です")
+    if page_reference is not None:
+        page_reference.validate_location(index.page_count, toc_pages)
     search = HeadingIndex(index, toc_pages)
     candidates = []
     raw_anchors = []
@@ -296,7 +328,7 @@ def match_entries(
         if progress:
             progress(0.65 * (i + 1) / max(1, len(entries)))
     anchors = monotone_anchors(raw_anchors)
-    page_map = PageMap(anchors)
+    page_map = PageMap(anchors, page_reference)
     results = []
     warnings = list(page_map.warnings)
     if len(anchors) < len(raw_anchors):
