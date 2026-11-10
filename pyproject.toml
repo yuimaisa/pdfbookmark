@@ -33,3 +33,39 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "osx-64", "win-64"]
+requires-pixi = ">=0.84.1"
+# Only Python comes from conda; all application and dev packages come from PyPI.
+conda-pypi-map = false
+
+[tool.pixi.pypi-dependencies]
+pdfbookmark = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+start = "streamlit run app.py"
+
+[tool.pixi.feature.dev.tasks]
+test = "pytest -m 'not integration'"
+lint = "ruff check ."
+format = "ruff format ."
+format-check = "ruff format --check ."
+check = { depends-on = ["lint", "format-check", "test"] }
+test-deepseek = "pytest tests/test_deepseek_integration.py -m integration -q"
+test-openai = "pytest tests/test_openai_integration.py -m integration -q"
+
+[tool.pixi.feature.py311.dependencies]
+python = "3.11.*"
+
+[tool.pixi.feature.py312.dependencies]
+python = "3.12.*"
+
+[tool.pixi.feature.py313.dependencies]
+python = "3.13.*"
+
+[tool.pixi.environments]
+default = { features = ["dev", "py312"] }
+py311 = { features = ["dev", "py311"] }
+py313 = { features = ["dev", "py313"] }
